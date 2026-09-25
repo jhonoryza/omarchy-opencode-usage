@@ -32,6 +32,15 @@ AGENT_NAME = "OpenCode"
 AUTH_HELP = "Sign in inside OpenCode to keep recording usage."
 MAX_RECORD_BYTES = 1_000_000
 
+# Resource ceilings for data read from the mutable message store. Any
+# violation fails closed: the collector publishes a fresh empty-stats
+# record, never a truncated one — and never holds the whole table in
+# memory (rows stream off the cursor one at a time).
+MAX_ROWS = 50_000  # message rows examined per run
+MAX_ROW_CHARS = 10_000_000  # characters of a single message payload
+MAX_MODELS = 200  # distinct model names retained
+MAX_MODEL_NAME_LEN = 200  # characters per model name
+
 
 def opencode_db() -> Path:
     return Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")) / "opencode" / "opencode.db"
@@ -104,12 +113,21 @@ def scan_opencode() -> dict[str, Any]:
     try:
         conn.execute("PRAGMA query_only = ON")
         try:
-            rows = conn.execute("SELECT session_id, data FROM message").fetchall()
+            cursor = conn.execute("SELECT session_id, data FROM message")
         except sqlite3.Error as exc:
             print(f"Ignoring OpenCode scan error: {exc}", file=sys.stderr)
             return stats
 
-        for session_id, raw in rows:
+        # Stream rows off the cursor: a long-lived database can hold large
+        # transcript JSON bodies, so the table is never materialized with
+        # fetchall() on the five-minute schedule.
+        examined = 0
+        for session_id, raw in cursor:
+            examined += 1
+            if examined > MAX_ROWS:
+                return empty_stats()
+            if not isinstance(raw, str) or len(raw) > MAX_ROW_CHARS:
+                continue
             try:
                 entry = json.loads(raw)
             except Exception:
@@ -132,6 +150,8 @@ def scan_opencode() -> dict[str, Any]:
             # modelID looks like "muse-spark-1.3-contributor-free" or
             # "provider/model"; keep the short tail like the claude collector.
             model = str(entry.get("modelID") or "opencode").rstrip("/").split("/")[-1]
+            if len(model) > MAX_MODEL_NAME_LEN or (model not in model_usage and len(model_usage) >= MAX_MODELS):
+                return empty_stats()
 
             session_key = "opencode:" + str(session_id)
             sessions.add(session_key)
