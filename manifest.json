@@ -5,7 +5,8 @@
   "version": "1.0.0",
   "author": "dell",
   "description": "Display OpenCode usage in the Omarchy agents panel.",
-  "homepage": "",
+  "homepage": "https://github.com/jhonoryza/omarchy-opencode-usage",
+  "license": "MIT",
   "kinds": ["panel"],
   "keepLoaded": true,
   "entryPoints": {

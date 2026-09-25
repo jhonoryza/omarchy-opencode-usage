@@ -25,6 +25,12 @@ and
 omarchy plugin add https://github.com/jhonoryza/omarchy-opencode-usage.git --enable
 ```
 
+## Removal
+
+```bash
+omarchy plugin remove dell.opencode-usage
+```
+
 ## Manual test
 
 ```bash
@@ -42,6 +48,13 @@ omarchy-shell shell rescanPlugins
   directory, so a custom `opencode.svg` belongs there (see
   [omarchy-agents-pin](https://github.com/jhonoryza/omarchy-agents-pin)),
   not in this repo. Without one the panel falls back to its default glyph.
+
+## Dependencies
+
+- Python 3 (standard library only, no extra packages).
+- OpenCode sessions in `~/.local/share/opencode/opencode.db` (respects
+  `XDG_DATA_HOME` if set), opened read-only. Nothing is written outside
+  `~/.local/state/omarchy/agents/usage/`.
 
 ## License
 
