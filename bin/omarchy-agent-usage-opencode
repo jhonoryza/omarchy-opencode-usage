@@ -1,0 +1,238 @@
+#!/usr/bin/python3
+# omarchy:summary=Print the OpenCode usage record as JSON
+# omarchy:args=[--force] [--limits-only]
+# omarchy:hidden=true
+"""Collect OpenCode usage into one display-ready JSON record.
+
+OpenCode keeps sessions in SQLite (~/.local/share/opencode/opencode.db,
+table `message`, JSON in `data` column) since v1.2.0. Every assistant message
+carries `providerID`, `modelID`, `tokens` ({input, output, reasoning,
+cache: {read, write}}) and `time` ({created, completed} in ms).
+
+The agents panel only ever reads the JSON this prints; it never talks to
+the database directly. OpenCode exposes no quota endpoint, so `limits`
+stays empty — local stats only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import shutil
+import sqlite3
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+AGENT_ID = "opencode"
+AGENT_NAME = "OpenCode"
+AUTH_HELP = "Sign in inside OpenCode to keep recording usage."
+MAX_RECORD_BYTES = 1_000_000
+
+
+def opencode_db() -> Path:
+    return Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")) / "opencode" / "opencode.db"
+
+
+def date_string(value: dt.date) -> str:
+    return value.strftime("%Y-%m-%d")
+
+
+def recent_date_strings() -> list[str]:
+    today = dt.datetime.now().date()
+    return [date_string(today - dt.timedelta(days=offset)) for offset in range(6, -1, -1)]
+
+
+def number(value: Any) -> int:
+    try:
+        n = float(value or 0)
+        return round(n) if n == n else 0
+    except Exception:
+        return 0
+
+
+def empty_stats() -> dict[str, Any]:
+    return {
+        "todayPrompts": 0,
+        "todaySessions": 0,
+        "todayTotalTokens": 0,
+        "todayTokensByModel": {},
+        "recentDays": [{"date": d, "messageCount": 0} for d in recent_date_strings()],
+        "totalPrompts": 0,
+        "totalSessions": 0,
+        "activeDates": [],
+        "activeDays": 0,
+        "modelUsage": {},
+    }
+
+
+def empty_bucket() -> dict[str, int]:
+    return {
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "cacheReadInputTokens": 0,
+        "cacheCreationInputTokens": 0,
+    }
+
+
+def scan_opencode() -> dict[str, Any]:
+    stats = empty_stats()
+    today = stats["recentDays"][-1]["date"]
+
+    db = opencode_db()
+    if not db.is_file():
+        return stats
+
+    sessions: set[str] = set()
+    today_sessions: set[str] = set()
+    active_days: set[str] = set()
+    date_tokens: dict[str, int] = {}
+    today_tokens: dict[str, int] = {}
+    model_usage: dict[str, dict[str, int]] = {}
+    prompts = 0
+    today_prompt_count = 0
+    today_token_total = 0
+
+    try:
+        conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+    except sqlite3.Error as exc:
+        print(f"Ignoring unreadable OpenCode database {db}: {exc}", file=sys.stderr)
+        return stats
+    try:
+        conn.execute("PRAGMA query_only = ON")
+        try:
+            rows = conn.execute("SELECT session_id, data FROM message").fetchall()
+        except sqlite3.Error as exc:
+            print(f"Ignoring OpenCode scan error: {exc}", file=sys.stderr)
+            return stats
+
+        for session_id, raw in rows:
+            try:
+                entry = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(entry, dict) or entry.get("role") != "assistant":
+                continue
+            tokens = entry.get("tokens") or {}
+            cache = tokens.get("cache") or {}
+            input_tokens = number(tokens.get("input"))
+            # opencode keeps thinking tokens out of output; both are generated.
+            output_tokens = number(tokens.get("output")) + number(tokens.get("reasoning"))
+            cache_read = number(cache.get("read"))
+            cache_write = number(cache.get("write"))
+            total = input_tokens + output_tokens + cache_read + cache_write
+            if total <= 0:
+                continue
+
+            created = number((entry.get("time") or {}).get("created"))
+            day = dt.datetime.fromtimestamp(created / 1000).strftime("%Y-%m-%d") if created > 0 else today
+            # modelID looks like "muse-spark-1.3-contributor-free" or
+            # "provider/model"; keep the short tail like the claude collector.
+            model = str(entry.get("modelID") or "opencode").rstrip("/").split("/")[-1]
+
+            session_key = "opencode:" + str(session_id)
+            sessions.add(session_key)
+            active_days.add(day)
+            prompts += 1
+            date_tokens[day] = date_tokens.get(day, 0) + total
+
+            bucket = model_usage.setdefault(model, empty_bucket())
+            bucket["inputTokens"] += input_tokens
+            bucket["outputTokens"] += output_tokens
+            bucket["cacheReadInputTokens"] += cache_read
+            bucket["cacheCreationInputTokens"] += cache_write
+
+            if day == today:
+                today_prompt_count += 1
+                today_sessions.add(session_key)
+                today_token_total += total
+                today_tokens[model] = today_tokens.get(model, 0) + total
+    finally:
+        conn.close()
+
+    stats["todayPrompts"] = today_prompt_count
+    stats["todaySessions"] = len(today_sessions)
+    stats["todayTotalTokens"] = today_token_total
+    stats["todayTokensByModel"] = today_tokens
+    stats["totalPrompts"] = prompts
+    stats["totalSessions"] = len(sessions)
+    stats["modelUsage"] = model_usage
+    stats["activeDates"] = sorted(active_days)
+    stats["activeDays"] = len(active_days)
+    for day_entry in stats["recentDays"]:
+        day_entry["messageCount"] = date_tokens.get(day_entry["date"], 0)
+    return stats
+
+
+def build_record(stats: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schemaVersion": 1,
+        "id": AGENT_ID,
+        "name": AGENT_NAME,
+        "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "ready": number(stats.get("totalPrompts")) > 0,
+        "hasLocalStats": True,
+        "tierLabel": "",
+        "usageStatusText": "",
+        "authHelpText": AUTH_HELP,
+        "limits": [],
+        **stats,
+    }
+
+
+def write_record(payload: str) -> None:
+    home = Path(os.environ.get("HOME") or "~").expanduser()
+    state_home = Path(os.environ.get("XDG_STATE_HOME") or (home / ".local" / "state"))
+    output_dir = state_home / "omarchy" / "agents" / "usage"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_file = output_dir / f"{AGENT_ID}.json"
+
+    if output_dir.is_symlink():
+        raise OSError(f"Output directory is a symlink: {output_dir}")
+    if output_file.exists() or output_file.is_symlink():
+        if output_file.is_symlink():
+            raise OSError(f"Output file is a symlink: {output_file}")
+        if not output_file.is_file():
+            raise OSError(f"Output file is not a regular file: {output_file}")
+
+    fd, temp_path = tempfile.mkstemp(dir=str(output_dir), text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        shutil.move(temp_path, str(output_file))
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--limits-only", action="store_true")
+    parser.add_argument("--write", action="store_true",
+                        help="Write to ~/.local/state/omarchy/agents/usage/opencode.json instead of stdout")
+    args = parser.parse_args()
+
+    stats = scan_opencode()
+    payload = json.dumps(build_record(stats), indent=2)
+    if len(payload.encode("utf-8")) > MAX_RECORD_BYTES:
+        payload = json.dumps(build_record(empty_stats()), indent=2)
+
+    if args.write:
+        try:
+            write_record(payload)
+        except (OSError, IOError) as exc:
+            print(f"opencode-usage: write failed: {exc}", file=sys.stderr)
+            raise SystemExit(1)
+    else:
+        print(payload)
+
+
+if __name__ == "__main__":
+    main()
