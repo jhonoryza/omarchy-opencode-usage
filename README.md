@@ -1,16 +1,31 @@
-# OpenCode Usage for Omarchy agents panel
+# OpenCode Usage for Omarchy
 
-Menampilkan usage OpenCode di panel `omarchy.agents`, pola sama seperti
-`dell.commandcode-usage` dan `wellatleastitried/omarchy-copilot-panel-usage`.
+Shows OpenCode usage in the Omarchy agents panel, following the pattern of
+[`wellatleastitried/omarchy-copilot-panel-usage`](https://github.com/wellatleastitried/omarchy-copilot-panel-usage)
+and
+[`jhonoryza/omarchy-commandcode-usage`](https://github.com/jhonoryza/omarchy-commandcode-usage).
 
-## Cara kerja
+![OpenCode tab in the Omarchy agents panel](./preview.png)
 
-* `bin/omarchy-agent-usage-opencode` baca SQLite `~/.local/share/opencode/opencode.db`
-  (tabel `message`, kolom JSON `data`), hitung prompt/token per hari dan per model.
-* Tulis ke `~/.local/state/omarchy/agents/usage/opencode.json`.
-* `ui/main.qml` jalan tiap 5 menit + saat usage dir berubah.
+## How it works
 
-## Test manual
+- `bin/omarchy-agent-usage-opencode` reads the SQLite database at
+  `~/.local/share/opencode/opencode.db` (table `message`, JSON payloads in
+  the `data` column), tallies prompts and tokens per day and per model, and
+  writes `~/.local/state/omarchy/agents/usage/opencode.json`. The database
+  is only ever opened read-only.
+- `ui/main.qml` runs the collector every 5 minutes and whenever the usage
+  directory changes.
+- The agents panel picks up the new tab automatically once the JSON record
+  exists. Nothing under `/usr/share/omarchy` is touched.
+
+## Install
+
+```bash
+omarchy plugin add https://github.com/jhonoryza/omarchy-opencode-usage.git --enable
+```
+
+## Manual test
 
 ```bash
 ~/.config/omarchy/plugins/dell.opencode-usage/bin/omarchy-agent-usage-opencode | head -n 40
@@ -18,3 +33,16 @@ Menampilkan usage OpenCode di panel `omarchy.agents`, pola sama seperti
 omarchy plugin validate ~/.config/omarchy/plugins/dell.opencode-usage
 omarchy-shell shell rescanPlugins
 ```
+
+## Notes
+
+- OpenCode exposes no quota endpoint, so `limits` stays empty — what you
+  get is local stats: today, the last 7 days, and all-time totals per model.
+- The panel resolves provider icons from the *agents* plugin's `assets/`
+  directory, so a custom `opencode.svg` belongs there (see
+  [omarchy-agents-pin](https://github.com/jhonoryza/omarchy-agents-pin)),
+  not in this repo. Without one the panel falls back to its default glyph.
+
+## License
+
+MIT
