@@ -113,7 +113,14 @@ def scan_opencode() -> dict[str, Any]:
     try:
         conn.execute("PRAGMA query_only = ON")
         try:
-            cursor = conn.execute("SELECT session_id, data FROM message")
+            # Filter oversized payloads in SQL: length(data) is evaluated by
+            # SQLite itself, so a multi-hundred-MB transcript row is never
+            # materialized into Python memory where the MAX_ROW_CHARS check
+            # below could only reject it after the fact.
+            cursor = conn.execute(
+                "SELECT session_id, data FROM message WHERE length(data) <= ?",
+                (MAX_ROW_CHARS,),
+            )
         except sqlite3.Error as exc:
             print(f"Ignoring OpenCode scan error: {exc}", file=sys.stderr)
             return stats
